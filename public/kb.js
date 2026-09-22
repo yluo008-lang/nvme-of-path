@@ -70,9 +70,9 @@
     u32 kato;         /* keep-alive 超时 (ms) */
     ...
 };`,
-    nvmf_transport: `struct nvmf_transport_ops {
-    int (*create_ctrl)(struct device *,
-                       struct nvmf_ctrl_options *);
+    nvmf_transport_ops: `struct nvmf_transport_ops {   /* drivers/nvme/host/fabrics.h */
+    int (*create_ctrl)(struct device *dev,
+                       struct nvmf_ctrl_options *opts);
     ...
 };
 /* rdma: nvme_rdma_transport; tcp: nvme_tcp_transport */`,
@@ -86,9 +86,10 @@
     __le32 kato;    /* keep-alive (ms) */
     ...
 };`,
-    nvmf_discovery_log: `struct nvmf_discovery_log {        /* Discovery Log */
-    __le32 numrec;                  /* 条目数 */
-    struct nvmf_disc_log_entry entries[];
+    nvmf_disc_rsp_page_hdr: `struct nvmf_disc_rsp_page_hdr {   /* include/linux/nvme.h */
+    __le64 genctr;                  /* 世代计数 */
+    __le64 numrec;                  /* 条目数 */
+    struct nvmf_disc_rsp_page_entry entries[];
     /* 每条: subnqn / trtype / adrfam / traddr / trsvcid */
 };`,
     nvme_ctrl: `struct nvme_ctrl {             /* Host 侧控制器 */
@@ -125,11 +126,12 @@
     struct nvme_tcp_request *reqs;  /* CID -> request 映射 */
     ...
 };`,
-    nvme_tcp_pdu: `struct nvme_tcp_hdr {            /* TCP PDU 头 (24B) */
+    nvme_tcp_hdr: `struct nvme_tcp_hdr {              /* include/linux/nvme-tcp.h */
     __u8 type;   /* 00 ICReq, 01 Cmd, 02 H2CData, 03 C2HData, 04 Rsp */
     __u8 flags;  __u8 hlen; __u8 pdo;
     __le32 plen; /* PDU 总长 */
-};`,
+};
+/* 同文件还有: nvme_tcp_cmd_pdu / nvme_tcp_data_pdu / nvme_tcp_rsp_pdu */`,
     nvmet_subsys: `struct nvmet_subsys {            /* Target 子系统 */
     char subsysnqn[256];
     struct list_head ctrls;
@@ -198,14 +200,15 @@ nvmet create-subsys nqn.test
 nvmet create-ns 1 --bdev /dev/sda
 nvmet create-port 1 -t tcp -a 192.168.1.10 -s 8009`,
     "发起 Discovery": `nvme discover -t tcp -a 192.168.1.10 -s 8009
-/* 先连 Discovery 控制器 (well-known NQN) */
-nvmf_get_discovery_log_page(ctrl);   /* LID = 02h */`,
+/* 先建 Discovery 控制器 (well-known NQN) */
+ctrl = nvmf_create_ctrl(dev, opts);
+/* 随后发 Get Log Page (LID=02h) 取条目，见下一步 */`,
     "Discovery Admin 连接": `/* RDMA: 建 RC QP + 注册 Admin 内存 */
 nvme_rdma_configure_admin_queue(ctrl);
 /* TCP: 建 socket + ICReq/ICResp 握手 */
 nvme_tcp_create_queue(ctrl, 0);`,
-    "获取 Discovery Log": `cmd.common.opcode = nvme_admin_get_log_page;  /* 02h */
-cmd.get_log_page.lid = NVME_LOG_DISC;            /* 02h */
+    "获取 Discovery Log": `nvme_get_log(ctrl, nsid, NVME_LOG_DISC, ...);
+  /* opcode = nvme_admin_get_log_page (02h), lid = 02h discovery */
 /* entries[i]: subnqn / trtype / traddr / trsvcid */`,
     "解析连接参数": `nvmf_parse_options(opts);
 /* trtype=tcp, traddr=192.168.1.10, trsvcid=8009 */
@@ -223,14 +226,13 @@ cmd.connect.kato    = 5000;      /* keep-alive ms */`,
     ctrl->cntlid = ida_alloc(...);   /* 分配控制器 ID */
     list_add(&ctrl->queue, &subsys->ctrls);
 }`,
-    "协商队列数 / KeepAlive": `nvme_set_queue_count(ctrl, &nr_queues);
-nvme_keep_alive_work();   /* 定时发 Fabrics KeepAlive (kato) */`,
+    "协商队列数 / KeepAlive": `nvme_set_queue_count(ctrl, &nr_queues);  /* Set Features 定队列数 */
+/* kato: 定时发 Fabrics KeepAlive，超时 Target 删控制器 */`,
     "建 IO 队列连接": `for (qid = 1; qid <= nr_queues; qid++)
     nvmf_connect_io_queue(ctrl, qid);
 /* 每个 qid 一次 Connect；RDMA=一对 QP，TCP=一个 socket */`,
-    "队列绑定 CPU / tagset": `/* RDMA */ nvme_rdma_alloc_tagset(ctrl, ...);
-/* TCP  */ nvme_tcp_alloc_tagset(ctrl, ...);
-blk_mq_map_queues(&ctrl->tagset);   /* 每核队列 */`,
+    "队列绑定 CPU / tagset": `nvme_alloc_io_tag_set(ctrl, &ctrl->tag_set, &ops, nr_queues, 0);
+blk_mq_map_queues(&ctrl->tagset);   /* 每核队列 (rdma/tcp 共用) */`,
     "Identify + 扫描命名空间": `/* Capsule 承载 admin 命令 */
 nvme_identify_ctrl(ctrl, &id);        /* cntlid / subnqn */
 nvme_identify_ns(ctrl, nsid, &id_ns); /* nsze / lbaf */
@@ -255,9 +257,10 @@ blk_mq_sched_insert_request(req);`,
 cmd->common.nsid   = ns->head->ns_id;
 cmd->rw.slba  = cpu_to_le64(blk_rq_pos(req) >> (ns->lba_shift - 9));
 cmd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);`,
-    "组装 Fabrics Capsule": `/* Command Capsule = SQE(64B) + 数据/SGL */
-/* RDMA: 填 SGL + rkey/addr；TCP: 再包一层 PDU 头 */
-cid = req->tag;   /* 响应原样带回配对 */`,
+    "组装 Fabrics Capsule": `/* Command Capsule = SQE(64B) + SGL */
+nvme_rdma_map_data(queue, rq);   /* RDMA: 注册 MR，填 rkey/addr */
+nvme_tcp_map_data(queue, rq);    /* TCP: 映射内存，准备分 PDU 发送 */
+/* cid = blk_mq tag; 响应原样带回配对 */`,
 
     "RDMA 发起端入队发送": `nvme_rdma_queue_rq(hctx, bd)
 {
@@ -281,10 +284,11 @@ SEND:        Target -> Host (Response Capsule)`,
 cqe.command_id = cmd.command_id;   /* CID 配对 */
 cqe.status = NVME_SC_SUCCESS;
 ib_post_send(qp, &rsp_wr, NULL);    /* SEND 发回 */`,
-    "Host 收完成 (RDMA CQ)": `nvme_rdma_process_cq(nvme_rdma_queue *q)
+    "Host 收完成 (RDMA CQ)": `/* IB CQ 到完成 → 按 CID 找原 request */
+static void nvme_rdma_complete_rq(struct request *rq)
 {
-    ib_poll_cq(q->cq, ...);        /* 取 SEND/WRITE 完成 */
-    blk_mq_complete_request(req);  /* -> blk_mq_end_request */
+    ...
+    nvme_complete_rq(rq);          /* -> blk_mq 收尾 */
 }`,
     "bio_endio 唤醒进程": `blk_update_request(req, error, nr_bytes);
 bio_endio(req->bio);   /* 解锁 folio / 唤醒进程 */`,
@@ -307,9 +311,11 @@ nvmet_tcp_queue_response()       /* 回 Rsp；读另发 C2HData */`,
     "Target 回 Rsp PDU": `pdu->type = NVME_TCP_RSP;   /* 04h */
 pdu->rcccid = cmd.cccid;         /* 配对 */
 sock_sendmsg(sock, ...);`,
-    "Host 收完成 (TCP socket)": `nvme_tcp_process_cqe(req);
-  /* 从 socket 读 Rsp PDU，按 cccid 找原 request */
-blk_mq_complete_request(req);`,
+    "Host 收完成 (TCP socket)": `/* 从 socket 读 Rsp PDU，按 cccid 找原 request */
+void nvme_complete_rq(struct request *req)
+{
+    blk_mq_complete_request(req);  /* rdma/tcp 共用收尾 */
+}`,
 
     "填充 SQ ring": `struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
 io_uring_prep_read(sqe, fd, buf, 4096, offset);
@@ -334,14 +340,15 @@ io_uring_cqe = ...;   /* 应用零 syscall 批量收割 */`
       { n: "kato", d: "Keep-Alive 超时 (ms)，0=不保活" },
       { n: "cntlid (响应)", d: "Target 分配的控制器 ID" }
     ],
-    nvmf_discovery_log: [
+    nvmf_disc_rsp_page_hdr: [
+      { n: "genctr", d: "世代计数：日志变化一次加一" },
       { n: "numrec", d: "日志条目数" },
       { n: "subnqn", d: "可连接的子系统 NQN" },
       { n: "trtype", d: "传输类型：rdma / tcp / fc" },
       { n: "adrfam", d: "地址族：ipv4 / ipv6 / ib" },
       { n: "traddr / trsvcid", d: "目标地址与服务端口（如 4420/8009）" }
     ],
-    nvme_tcp_pdu: [
+    nvme_tcp_hdr: [
       { n: "ICReq/ICResp", b: "建连", d: "TCP 建连握手：协商 PDU 版本、队列深度、digest" },
       { n: "Cmd (01h)", b: "H->C", d: "命令胶囊：SQE + cccid，写小包可内联数据" },
       { n: "H2CData (02h)", b: "H->C", d: "写数据：cccid + data_offset + data_length" },

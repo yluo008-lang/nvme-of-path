@@ -37,7 +37,7 @@ window.APP_DATA = (function () {
     steps: [
       { layer: "mod", title: "加载 Host 传输模块",
         desc: "modprobe nvme-rdma / nvme-tcp：注册 Fabrics 传输，向 nvmf_transport 注册 rdma/tcp 的 create_ctrl 回调。",
-        file: "drivers/nvme/host/rdma.c", func: "nvme_rdma_init_module", structs: ["nvmf_transport"],
+        file: "drivers/nvme/host/rdma.c", func: "nvme_rdma_init_module", structs: ["nvmf_transport_ops"],
         code: "nvmf_register_transport(&nvme_rdma_transport);\n/* .create_ctrl = nvme_rdma_create_ctrl */\n/* tcp: nvmf_register_transport(&nvme_tcp_transport); */" },
       { layer: "mod", title: "Target 侧就绪 (nvmet)",
         desc: "Target 上 modprobe nvmet / nvmet-rdma / nvmet-tcp，创建子系统、命名空间并建 port（traddr/trsvcid），开始监听。",
@@ -45,14 +45,14 @@ window.APP_DATA = (function () {
         code: "nvmet create-subsys nqn.test --namespaces 1\nnvmet create-port 1 --trtype rdma --traddr 192.168.1.10" },
       { layer: "disc", title: "发起 Discovery",
         desc: "nvme discover -t rdma/tcp -a <traddr>：Host 先连上众所周知的 Discovery 控制器（NQN 为 discovery NQN），准备取日志页。",
-        file: "drivers/nvme/host/fabrics.c", func: "nvmf_get_discovery_log_page", structs: ["nvmf_discovery_log"],
-        code: "nvme discover -t tcp -a 192.168.1.10 -s 8009\n/* 连接 Discovery 控制器，再发 Get Log Page (LID=02h) */" },
+        file: "drivers/nvme/host/fabrics.c", func: "nvmf_create_ctrl", structs: ["nvmf_ctrl_options"],
+        code: "nvme discover -t tcp -a 192.168.1.10 -s 8009\n/* 建 Discovery 控制器，再发 Get Log Page (LID=02h) */" },
       { layer: "disc", title: "Discovery Admin 连接",
         desc: "与 Discovery 控制器建 Admin 队列：RDMA 建 RC QP + 注册 Admin SQ/CQ 内存；TCP 发 ICReq/ICResp 握手、协商 PDU 与队列深度。",
         file: "drivers/nvme/host/fabrics.c", func: "nvmf_connect_admin_queue", structs: ["nvmf_ctrl_options"] },
       { layer: "disc", title: "获取 Discovery Log",
         desc: "发 Get Log Page（LID 02h）取回 numrec：每条含 subnqn、trtype、adrfam、traddr、trsvcid，Host 据此知道有哪些子系统可连。",
-        file: "drivers/nvme/host/fabrics.c", func: "nvmf_get_discovery_log_page", structs: ["nvmf_discovery_log"],
+        file: "drivers/nvme/host/core.c", func: "nvme_get_log", structs: ["nvmf_disc_rsp_page_hdr"],
         code: "cmd.common.opcode = nvme_admin_get_log_page;  /* 02h */\ncmd.get_log_page.lid = NVME_LOG_DISC;         /* 02h discovery */\n/* entry->subnqn, entry->trtype, entry->traddr ... */" },
       { layer: "conn", title: "解析连接参数",
         desc: "nvmf_parse_options() 解析 trtype/adrfam/traddr/trsvcid/hostnqn/subnqn：决定走 rdma 还是 tcp，以及连哪个 port。",
@@ -67,18 +67,18 @@ window.APP_DATA = (function () {
         code: "cmd.fabrics.opcode = 0x7f;         /* Fabrics */\ncmd.fabrics.fctype = 0x01;         /* Connect */\ncmd.connect.qid = 0;               /* admin */\ncmd.connect.sqsize = ...; cmd.connect.kato = 5000; /* ms */" },
       { layer: "conn", title: "Target 分配控制器",
         desc: "nvmet_execute_io_connect()：Target 校验 hostnqn/subnqn、分配 cntlid，把该连接挂到对应子系统；Admin 队列就绪，可发 Identify/Property 命令。",
-        file: "drivers/nvme/target/fabrics.c", func: "nvmet_execute_io_connect", structs: ["nvmet_ctrl"] },
+        file: "drivers/nvme/target/fabrics-cmd.c", func: "nvmet_execute_io_connect", structs: ["nvmet_ctrl"] },
       { layer: "queue", title: "协商队列数 / KeepAlive",
         desc: "发 Set Features（队列数）、Property Set/Get 配控制器；kato 保活：Host 定时发 Keep Alive，超时 Target 删控制器防挂死。",
-        file: "drivers/nvme/host/fabrics.c", func: "nvmf_set_queue_number", structs: ["nvmf_ctrl_options"],
+        file: "drivers/nvme/host/core.c", func: "nvme_set_queue_count", structs: ["nvmf_ctrl_options"],
         code: "nvme_set_queue_count(ctrl, &nr_queues);\n/* kato: nvme_keep_alive_work() 定时发送 Fabrics KeepAlive */" },
       { layer: "queue", title: "建 IO 队列连接",
         desc: "逐队列 nvmf_connect_io_queue()：每条 IO 队列再发一次 Connect (qid≥1)。RDMA 每队列一对 RC QP + 内存注册；TCP 每队列一个 socket + ICReq。",
         file: "drivers/nvme/host/fabrics.c", func: "nvmf_connect_io_queue",
         code: "for (qid = 1; qid <= nr_queues; qid++)\n    nvmf_connect_io_queue(ctrl, qid);  /* fctype=Connect, qid>=1 */" },
       { layer: "queue", title: "队列绑定 CPU / tagset",
-        desc: "nvme_rdma_alloc_tagset() / nvme_tcp_alloc_tagset() 建 blk-mq tagset，再 blk_mq_map_queues() 绑 CPU：每核队列、无锁并发。",
-        file: "drivers/nvme/host/rdma.c", func: "nvme_rdma_alloc_tagset", structs: ["blk_mq_tags"] },
+        desc: "nvme_alloc_io_tagset() 建 blk-mq tagset，再 blk_mq_map_queues() 绑 CPU：每核队列、无锁并发（rdma/tcp 共用该流程）。",
+        file: "drivers/nvme/host/core.c", func: "nvme_alloc_io_tagset", structs: ["blk_mq_tags"] },
       { layer: "ns", title: "Identify + 扫描命名空间",
         desc: "经 Capsule 发 Identify Controller/NS（CNS=1/0）：取 cntlid/subnqn/nsze/LBA 格式，再 nvme_alloc_ns() 建命名空间。",
         file: "drivers/nvme/host/core.c", func: "nvme_identify_ns", structs: ["nvme_id_ns", "nvme_ns"],
@@ -118,36 +118,38 @@ window.APP_DATA = (function () {
       code: "cmd->common.opcode = nvme_cmd_read;   /* 0x02, 写为 0x01 */\ncmd->common.nsid = ns->head->ns_id;\ncmd->rw.slba = cpu_to_le64(...);\ncmd->rw.length = cpu_to_le16(...);" }
   ];
 
-  // ---- Fabrics 封装（读写复用）----
-  const S_fab = [
-    { layer: "fabrics", title: "组装 Fabrics Capsule",
-      desc: "把 SQE 装进命令胶囊 (Command Capsule)：SQE + 内联数据/分散表；CID 用于配对响应。RDMA 另备 SGL/密钥，TCP 另定 PDU 头。",
-      file: "drivers/nvme/host/fabrics.c", func: "nvmf_capsule_cmd", structs: ["nvme_command", "nvmf_connect_command"],
-      code: "/* Command Capsule = SQE(64B) + 数据/SGL */\n/* cid = blk_mq tag; 响应原样带回配对 */" }
-  ];
+  // ---- Fabrics 封装（RDMA / TCP 各一版，map_data 负责 SGL 与内存注册）----
+  const Fab_R = { layer: "fabrics", title: "组装 Fabrics Capsule",
+      desc: "把 SQE 装进命令胶囊 (Command Capsule)：SQE + SGL；nvme_rdma_map_data() 注册内存、填 rkey/addr，CID(=blk-mq tag)用于配对响应。",
+      file: "drivers/nvme/host/rdma.c", func: "nvme_rdma_map_data", structs: ["nvme_command"],
+      code: "/* Command Capsule = SQE(64B) + SGL */\nnvme_rdma_map_data(queue, rq);   /* 注册 MR，填 rkey/addr */\n/* cid = blk_mq tag; 响应原样带回配对 */" };
+  const Fab_T = { layer: "fabrics", title: "组装 Fabrics Capsule",
+      desc: "把 SQE 装进命令胶囊：SQE + SGL；nvme_tcp_map_data() 映射内存算好分段，之后再包一层 TCP PDU 头发出。",
+      file: "drivers/nvme/host/tcp.c", func: "nvme_tcp_map_data", structs: ["nvme_command"],
+      code: "/* Command Capsule = SQE(64B) + SGL */\nnvme_tcp_map_data(queue, rq);    /* 映射内存，准备分 PDU 发送 */" };
 
   // ---- RDMA 下行（读场景用）----
   const S_rdma = [
     { layer: "tr_ini", title: "RDMA 发起端入队发送",
-      desc: "nvme_rdma_queue_rq()：取一对 Send/Recv WR，把 Capsule 经 IB_SEND 发出；大数据先注册 MR（ib_reg_mr），把 rkey/addr 填进 SGL 供 Target 直写/直读。",
+      desc: "nvme_rdma_queue_rq()：把 Capsule 经 IB_SEND 发出；大数据先注册 MR，把 rkey/addr 填进 SGL 供 Target 直写/直读。",
       file: "drivers/nvme/host/rdma.c", func: "nvme_rdma_queue_rq", structs: ["nvme_rdma_queue"],
       code: "ib_post_send(qp, &wr, NULL);   /* SEND: command capsule */\n/* 读: 提供 rkey+addr, Target 用 RDMA WRITE 把数据直写主机 */" },
     { layer: "net", title: "RDMA 网络 (RC QP)",
       desc: "RC 可靠连接：Command Capsule 走 SEND；读数据 Target 用 RDMA WRITE 回主机、写数据 Target 用 RDMA READ 拉主机；完成走 RDMA SEND（Response Capsule）。",
-      file: "(IB/RoCE 网络)", func: "SEND / RDMA_WRITE / RDMA_READ", structs: [] },
+      file: "include/rdma/ib_verbs.h", func: "ib_post_send", structs: [] },
     { layer: "tr_tgt", title: "Target 收包并执行 (nvmet-rdma)",
       desc: "nvmet-rdma 收 SEND 取出 SQE → nvmet_req_execute()：读则从后端盘取数、RDMA WRITE 回 Host；写则 RDMA READ 拉数再落盘。",
-      file: "drivers/nvme/target/rdma.c", func: "nvmet_rdma_queue_response", structs: ["nvmet_req", "nvmet_ns"],
+      file: "drivers/nvme/target/rdma.c", func: "nvmet_rdma_execute_command", structs: ["nvmet_req", "nvmet_ns"],
       code: "/* 读: backend_read() -> ib_post_send(RDMA WRITE) */\n/* 写: ib_post_send(RDMA READ) -> backend_write() */" },
     { layer: "hw", title: "Target 后端存储执行",
       desc: "nvmet_bdev_execute_rw() 走块后端（bdev/file）：submit_bio 到 Target 本地盘/SSD；ZNS/文件后端同理，最终数据落介质。",
-      file: "drivers/nvme/target/io.c", func: "nvmet_bdev_execute_rw", structs: ["nvmet_ns"] },
+      file: "drivers/nvme/target/io-cmd-bdev.c", func: "nvmet_bdev_execute_rw", structs: ["nvmet_ns"] },
     { layer: "tr_tgt", title: "Target 回 Response Capsule",
       desc: "执行完组装响应胶囊（含 CQE + CID + 状态），经 SEND 发回 Host；CID 与命令胶囊一致，Host 靠它找原 request。",
       file: "drivers/nvme/target/rdma.c", func: "nvmet_rdma_queue_response", structs: ["nvme_completion"] },
     { layer: "complete", title: "Host 收完成 (RDMA CQ)",
-      desc: "nvme_rdma_process_cq() 从 IB CQ 取完成 → 找到 response capsule → blk_mq_complete_request() → blk_mq_end_request()。",
-      file: "drivers/nvme/host/rdma.c", func: "nvme_rdma_process_cq",
+      desc: "IB CQ 到完成 → nvme_rdma_complete_rq() 按 CID 找到原 request → nvme_complete_rq() → blk_mq 收尾。",
+      file: "drivers/nvme/host/rdma.c", func: "nvme_rdma_complete_rq",
       code: "ib_poll_cq(cq, ...);   /* 取 SEND/WRITE 完成 */\nblk_mq_complete_request(req);" },
     { layer: "complete", title: "bio_endio 唤醒进程",
       desc: "bio_endio() 完成 bio、解锁页，最终唤醒等待进程，read/write 返回用户态。",
@@ -158,26 +160,26 @@ window.APP_DATA = (function () {
   const S_tcp = [
     { layer: "tr_ini", title: "TCP 组装命令 PDU",
       desc: "nvme_tcp_setup_cmd_pdu()：Capsule 外加 TCP 传输头——PDU Type=Cmd(01h)、HLEN/PLEN、CID；写数据小包可内联，大包后续用 H2CData PDU 补发。",
-      file: "drivers/nvme/host/tcp.c", func: "nvme_tcp_setup_cmd_pdu", structs: ["nvme_tcp_pdu"],
+      file: "drivers/nvme/host/tcp.c", func: "nvme_tcp_setup_cmd_pdu", structs: ["nvme_tcp_hdr"],
       code: "pdu->type = NVME_TCP_CMD;   /* 01h Command Capsule */\npdu->hlen = sizeof(*pdu); pdu->plen = hlen + datalen;\npdu->cccid = req->tag;         /* 配对用 */" },
     { layer: "tr_ini", title: "TCP 发送 (socket)",
       desc: "nvme_tcp_try_send() 经 kernel socket 发出：Cmd PDU 先行；写大数据再发 H2CData PDU。读则等 Target 的 C2HData PDU 送数回来。",
       file: "drivers/nvme/host/tcp.c", func: "nvme_tcp_try_send", structs: ["nvme_tcp_queue"] },
     { layer: "net", title: "TCP 网络 (PDU 流)",
       desc: "TCP 字节流承载 PDU：ICReq/ICResp（建连握手）→ Cmd Capsule → H2CData（Host→Ctrl 数据）/ C2HData（Ctrl→Host 数据）→ Rsp Capsule。无 RDMA 卸载，全靠 CPU 拷包。",
-      file: "(TCP/IP 网络)", func: "Cmd / H2CData / C2HData / Rsp PDU", structs: ["nvme_tcp_pdu"] },
+      file: "net/ipv4/tcp.c", func: "tcp_sendmsg", structs: ["nvme_tcp_hdr"] },
     { layer: "tr_tgt", title: "Target 解析 PDU 并执行",
       desc: "nvmet-tcp 按 PDU 头收包：Cmd→取出 SQE 执行；写缺数据则发 R2T/等 H2CData；读则回 C2HData+Rsp。后端同样走 nvmet_bdev_execute_rw()。",
       file: "drivers/nvme/target/tcp.c", func: "nvmet_tcp_handle_h2c_data_pdu", structs: ["nvmet_req"] },
     { layer: "hw", title: "Target 后端存储执行",
       desc: "nvmet_bdev_execute_rw() 走块后端落盘；写需保证数据齐（H2CData 收全）才回成功，FUA/Flush 直通后端。",
-      file: "drivers/nvme/target/io.c", func: "nvmet_bdev_execute_rw", structs: ["nvmet_ns"] },
+      file: "drivers/nvme/target/io-cmd-bdev.c", func: "nvmet_bdev_execute_rw", structs: ["nvmet_ns"] },
     { layer: "tr_tgt", title: "Target 回 Rsp PDU",
       desc: "组装 Response Capsule PDU（Type=04h，含 CQE），经 socket 发回；读另先发 C2HData PDU 带数据。",
       file: "drivers/nvme/target/tcp.c", func: "nvmet_tcp_queue_response", structs: ["nvme_completion"] },
     { layer: "complete", title: "Host 收完成 (TCP socket)",
-      desc: "nvme_tcp_process_cqe() 从 socket 读 Rsp PDU → 配对 request → blk_mq_complete_request() → blk_mq_end_request()（软中断收尾）。",
-      file: "drivers/nvme/host/tcp.c", func: "nvme_tcp_process_cqe" },
+      desc: "从 socket 读到 Rsp PDU → 按 cccid 配对 request → nvme_complete_rq() → blk_mq 收尾（软中断）。",
+      file: "drivers/nvme/host/core.c", func: "nvme_complete_rq" },
     { layer: "complete", title: "bio_endio 唤醒进程",
       desc: "bio_endio() 完成 bio、解锁页，唤醒进程返回用户态。",
       file: "block/bio.c", func: "bio_endio" }
@@ -188,7 +190,7 @@ window.APP_DATA = (function () {
     key: "read", name: "主机读 (NVMe/RDMA)", cmd: "read (RDMA)",
     blurb: "read() → blk-mq → Fabrics Capsule → RDMA SEND/WRITE → nvmet 读盘 → Response Capsule 返回。输入 transport tcp 可对照 TCP 差异。",
     order: IO_ORDER,
-    steps: S_up.concat(S_fab).concat(S_rdma)
+    steps: S_up.concat([Fab_R]).concat(S_rdma)
   };
 
   // ===== 写场景（TCP）=====
@@ -196,7 +198,7 @@ window.APP_DATA = (function () {
     key: "write", name: "主机写 (NVMe/TCP)", cmd: "write (TCP)",
     blurb: "write() → blk-mq → Cmd PDU → H2CData → nvmet 落盘 → Rsp PDU。写大数据看 H2CData，FUA/Flush 直通后端。",
     order: IO_ORDER,
-    steps: S_up.concat(S_fab).concat(S_tcp)
+    steps: S_up.concat([Fab_T]).concat(S_tcp)
   };
 
   // ===== io_uring over Fabrics =====
@@ -214,7 +216,7 @@ window.APP_DATA = (function () {
       { layer: "fs", title: "进入读/写路径",
         desc: "与同步路径共用文件系统与块层：iomap → submit_bio → blk-mq，之后走 Fabrics。",
         file: "io_uring/rw.c", func: "io_rw → submit_bio" }
-    ].concat(S_up.slice(3)).concat(S_fab).concat(S_rdma).concat([
+    ].concat(S_up.slice(3)).concat([Fab_R]).concat(S_rdma).concat([
       { layer: "complete", title: "完成写入共享 CQ ring",
         desc: "传输收完 Response 后按 io_kiocb 回填 CQE 到共享完成环，应用零 syscall 批量收割。",
         file: "io_uring/io_uring.c", func: "io_uring_cqe" }
